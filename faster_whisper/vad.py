@@ -6,37 +6,31 @@ import warnings
 from typing import List, NamedTuple, Optional
 
 import numpy as np
+import auditok
+import io
+import scipy.io.wavfile
 
 from faster_whisper.utils import get_assets_path
 
 
-# The code below is adapted from https://github.com/snakers4/silero-vad.
 class VadOptions(NamedTuple):
     """VAD options.
 
     Attributes:
-      threshold: Speech threshold. Silero VAD outputs speech probabilities for each audio chunk,
-        probabilities ABOVE this value are considered as SPEECH. It is better to tune this
-        parameter for each dataset separately, but "lazy" 0.5 is pretty good for most datasets.
-      min_speech_duration_ms: Final speech chunks shorter min_speech_duration_ms are thrown out.
-      max_speech_duration_s: Maximum duration of speech chunks in seconds. Chunks longer
-        than max_speech_duration_s will be split at the timestamp of the last silence that
-        lasts more than 100ms (if any), to prevent aggressive cutting. Otherwise, they will be
-        split aggressively just before max_speech_duration_s.
-      min_silence_duration_ms: In the end of each speech chunk wait for min_silence_duration_ms
-        before separating it
-      window_size_samples: Audio chunks of window_size_samples size are fed to the silero VAD model.
-        WARNING! Silero VAD models were trained using 512, 1024, 1536 samples for 16000 sample rate.
-        Values other than these may affect model performance!!
-      speech_pad_ms: Final speech chunks are padded by speech_pad_ms each side
+      energy_threshold: Spectral energy of audio threshold.
+      min_speech_duration_s: Minimal speech chunks length.
+      max_speech_duration_s: Maximum duration of speech chunks in seconds. Better set big.
+      min_silence_duration_ms: Maximum duration of tolerated continuous silence within an event
+      dialation_s: Padding audio chunk from each side
+      mixing_distance_s: If speech chunks closer than this value, it will be merged
     """
 
-    threshold: float = 0.5
-    min_speech_duration_ms: int = 250
-    max_speech_duration_s: float = float("inf")
-    min_silence_duration_ms: int = 2000
-    window_size_samples: int = 1024
-    speech_pad_ms: int = 400
+    min_speech_duration_s: float = 0.2  # minimum duration of a valid audio event in seconds
+    max_speech_duration_s: float = 36000 # maximum duration of an event (10 hours now)
+    min_silence_duration_s: float = 0.5  # maximum duration of tolerated continuous silence within an event
+    dialation_s: float = 1.
+    mixing_distance_s: float = 3.
+    energy_threshold: int = 60
 
 
 def get_speech_timestamps(
@@ -54,138 +48,77 @@ def get_speech_timestamps(
     Returns:
       List of dicts containing begin and end samples of each speech chunk.
     """
+
+    SAMPLE_RATE = 16000
+    audio_darution_s = audio.shape[0]/SAMPLE_RATE
+
+    if audio_darution_s < 0.5:
+        return []
+
     if vad_options is None:
-        vad_options = VadOptions(**kwargs)
+        vad_options = VadOptions_1(max_speech_duration_s=audio_darution_s)
 
-    threshold = vad_options.threshold
-    min_speech_duration_ms = vad_options.min_speech_duration_ms
-    max_speech_duration_s = vad_options.max_speech_duration_s
-    min_silence_duration_ms = vad_options.min_silence_duration_ms
-    window_size_samples = vad_options.window_size_samples
-    speech_pad_ms = vad_options.speech_pad_ms
+    # Cheap normalization of the volume
+    audio = audio / max(0.1, np.max(np.abs(audio)))
 
-    if window_size_samples not in [512, 1024, 1536]:
-        warnings.warn(
-            "Unusual window_size_samples! Supported window_size_samples:\n"
-            " - [512, 1024, 1536] for 16000 sampling_rate"
-        )
+    byte_io = io.BytesIO(bytes())
+    scipy.io.wavfile.write(byte_io, SAMPLE_RATE, (audio * 32767).astype(np.int16))
+    bytes_wav = byte_io.read()
 
-    sampling_rate = 16000
-    min_speech_samples = sampling_rate * min_speech_duration_ms / 1000
-    speech_pad_samples = sampling_rate * speech_pad_ms / 1000
-    max_speech_samples = (
-        sampling_rate * max_speech_duration_s
-        - window_size_samples
-        - 2 * speech_pad_samples
+    segments = auditok.split(
+        bytes_wav,
+        sampling_rate=SAMPLE_RATE,                      # sampling frequency in Hz
+        channels=1,                                     # number of channels
+        sample_width=2,                                 # number of bytes per sample
+        min_dur=vad_options.min_speech_duration_s,      # minimum duration of a valid audio event in seconds
+        max_dur=vad_options.max_speech_duration_s,      # maximum duration of an event
+        max_silence=vad_options.min_silence_duration_s, # maximum duration of tolerated continuous silence within an event
+        energy_threshold=vad_options.energy_threshold,
+        drop_trailing_silence=True,
     )
-    min_silence_samples = sampling_rate * min_silence_duration_ms / 1000
-    min_silence_samples_at_max_speech = sampling_rate * 98 / 1000
 
-    audio_length_samples = len(audio)
+    segments = [{"start": s._meta.start * SAMPLE_RATE, "end": s._meta.end * SAMPLE_RATE} for s in segments]
 
-    model = get_vad_model()
-    state = model.get_initial_state(batch_size=1)
-
-    speech_probs = []
-    for current_start_sample in range(0, audio_length_samples, window_size_samples):
-        chunk = audio[current_start_sample : current_start_sample + window_size_samples]
-        if len(chunk) < window_size_samples:
-            chunk = np.pad(chunk, (0, int(window_size_samples - len(chunk))))
-        speech_prob, state = model(chunk, state, sampling_rate)
-        speech_probs.append(speech_prob)
-
-    triggered = False
-    speeches = []
-    current_speech = {}
-    neg_threshold = threshold - 0.15
-
-    # to save potential segment end (and tolerate some silence)
-    temp_end = 0
-    # to save potential segment limits in case of maximum segment size reached
-    prev_end = next_start = 0
-
-    for i, speech_prob in enumerate(speech_probs):
-        if (speech_prob >= threshold) and temp_end:
-            temp_end = 0
-            if next_start < prev_end:
-                next_start = window_size_samples * i
-
-        if (speech_prob >= threshold) and not triggered:
-            triggered = True
-            current_speech["start"] = window_size_samples * i
-            continue
-
-        if (
-            triggered
-            and (window_size_samples * i) - current_speech["start"] > max_speech_samples
-        ):
-            if prev_end:
-                current_speech["end"] = prev_end
-                speeches.append(current_speech)
-                current_speech = {}
-                # previously reached silence (< neg_thres) and is still not speech (< thres)
-                if next_start < prev_end:
-                    triggered = False
-                else:
-                    current_speech["start"] = next_start
-                prev_end = next_start = temp_end = 0
+    #Mixing nearest segments
+    dif_thresh = vad_options.mixing_distance_s * SAMPLE_RATE
+    speech_timestamps = segments
+    mixed_timestamps = []
+    if len(speech_timestamps) > 1:
+        start_point = speech_timestamps[0]["start"]
+        end_point = speech_timestamps[0]["end"]
+        for i in range(len(speech_timestamps) - 1):
+            if speech_timestamps[i + 1]["start"] - end_point < dif_thresh:
+                end_point = speech_timestamps[i + 1]["end"]
             else:
-                current_speech["end"] = window_size_samples * i
-                speeches.append(current_speech)
-                current_speech = {}
-                prev_end = next_start = temp_end = 0
-                triggered = False
-                continue
+                mixed_timestamps.append({"start": start_point, "end": end_point})
+                start_point = speech_timestamps[i + 1]["start"]
+                end_point = speech_timestamps[i + 1]["end"]
 
-        if (speech_prob < neg_threshold) and triggered:
-            if not temp_end:
-                temp_end = window_size_samples * i
-            # condition to avoid cutting in very short silence
-            if (window_size_samples * i) - temp_end > min_silence_samples_at_max_speech:
-                prev_end = temp_end
-            if (window_size_samples * i) - temp_end < min_silence_samples:
-                continue
+        mixed_timestamps.append({"start": start_point, "end": end_point})
+        segments = mixed_timestamps
+
+    if vad_options.dialation_s > 0:
+        dilatation = round(vad_options.dialation_s * SAMPLE_RATE)
+        new_segments = []
+        for seg in segments:
+            new_seg = {
+                "start": max(0, seg["start"] - dilatation),
+                "end": min(len(audio), seg["end"] + dilatation)
+            }
+            if len(new_segments) > 0 and new_segments[-1]["end"] >= new_seg["start"]:
+                new_segments[-1]["end"] = new_seg["end"]
             else:
-                current_speech["end"] = temp_end
-                if (
-                    current_speech["end"] - current_speech["start"]
-                ) > min_speech_samples:
-                    speeches.append(current_speech)
-                current_speech = {}
-                prev_end = next_start = temp_end = 0
-                triggered = False
-                continue
+                new_segments.append(new_seg)
+        segments = new_segments
 
-    if (
-        current_speech
-        and (audio_length_samples - current_speech["start"]) > min_speech_samples
-    ):
-        current_speech["end"] = audio_length_samples
-        speeches.append(current_speech)
 
-    for i, speech in enumerate(speeches):
-        if i == 0:
-            speech["start"] = int(max(0, speech["start"] - speech_pad_samples))
-        if i != len(speeches) - 1:
-            silence_duration = speeches[i + 1]["start"] - speech["end"]
-            if silence_duration < 2 * speech_pad_samples:
-                speech["end"] += int(silence_duration // 2)
-                speeches[i + 1]["start"] = int(
-                    max(0, speeches[i + 1]["start"] - silence_duration // 2)
-                )
-            else:
-                speech["end"] = int(
-                    min(audio_length_samples, speech["end"] + speech_pad_samples)
-                )
-                speeches[i + 1]["start"] = int(
-                    max(0, speeches[i + 1]["start"] - speech_pad_samples)
-                )
-        else:
-            speech["end"] = int(
-                min(audio_length_samples, speech["end"] + speech_pad_samples)
-            )
+    for seg in segments:
+        seg["start"] = round(seg["start"])
+        seg["end"] = round(seg["end"])
 
-    return speeches
+    sec_segments = [(el["start"]/SAMPLE_RATE, el["end"]/SAMPLE_RATE) for el in segments]
+    print(sec_segments)
+    return segments
 
 
 def collect_chunks(audio: np.ndarray, chunks: List[dict]) -> np.ndarray:
@@ -232,60 +165,3 @@ class SpeechTimestampsMap:
             bisect.bisect(self.chunk_end_sample, sample),
             len(self.chunk_end_sample) - 1,
         )
-
-
-@functools.lru_cache
-def get_vad_model():
-    """Returns the VAD model instance."""
-    path = os.path.join(get_assets_path(), "silero_vad.onnx")
-    return SileroVADModel(path)
-
-
-class SileroVADModel:
-    def __init__(self, path):
-        try:
-            import onnxruntime
-        except ImportError as e:
-            raise RuntimeError(
-                "Applying the VAD filter requires the onnxruntime package"
-            ) from e
-
-        opts = onnxruntime.SessionOptions()
-        opts.inter_op_num_threads = 1
-        opts.intra_op_num_threads = 1
-        opts.log_severity_level = 4
-
-        self.session = onnxruntime.InferenceSession(
-            path,
-            providers=["CPUExecutionProvider"],
-            sess_options=opts,
-        )
-
-    def get_initial_state(self, batch_size: int):
-        h = np.zeros((2, batch_size, 64), dtype=np.float32)
-        c = np.zeros((2, batch_size, 64), dtype=np.float32)
-        return h, c
-
-    def __call__(self, x, state, sr: int):
-        if len(x.shape) == 1:
-            x = np.expand_dims(x, 0)
-        if len(x.shape) > 2:
-            raise ValueError(
-                f"Too many dimensions for input audio chunk {len(x.shape)}"
-            )
-        if sr / x.shape[1] > 31.25:
-            raise ValueError("Input audio chunk is too short")
-
-        h, c = state
-
-        ort_inputs = {
-            "input": x,
-            "h": h,
-            "c": c,
-            "sr": np.array(sr, dtype="int64"),
-        }
-
-        out, h, c = self.session.run(None, ort_inputs)
-        state = (h, c)
-
-        return out, state
