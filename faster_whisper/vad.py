@@ -56,7 +56,7 @@ def get_speech_timestamps(
         return []
 
     if vad_options is None:
-        vad_options = VadOptions_1(max_speech_duration_s=audio_darution_s)
+        vad_options = VadOptions(max_speech_duration_s=audio_darution_s)
 
     # Cheap normalization of the volume
     audio = audio / max(0.1, np.max(np.abs(audio)))
