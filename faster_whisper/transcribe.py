@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import zlib
+import time
 
 from inspect import signature
 from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Tuple, Union
@@ -73,6 +74,7 @@ class TranscriptionInfo(NamedTuple):
     language_probability: float
     duration: float
     duration_after_vad: float
+    processing_time: float
     all_language_probs: Optional[List[Tuple[str, float]]]
     transcription_options: TranscriptionOptions
     vad_options: VadOptions
@@ -271,6 +273,7 @@ class WhisperModel:
             - a generator over transcribed segments
             - an instance of TranscriptionInfo
         """
+        start_processing_time = time.time()
         sampling_rate = self.feature_extractor.sampling_rate
 
         if not isinstance(audio, np.ndarray):
@@ -386,11 +389,15 @@ class WhisperModel:
         if speech_chunks:
             segments = restore_speech_timestamps(segments, speech_chunks, sampling_rate)
 
+        segments = list(segments)
+        finish_processing_time = time.time()
+
         info = TranscriptionInfo(
             language=language,
             language_probability=language_probability,
             duration=duration,
             duration_after_vad=duration_after_vad,
+            processing_time=round(finish_processing_time-start_processing_time, 1),
             transcription_options=options,
             vad_options=vad_parameters,
             all_language_probs=all_language_probs,

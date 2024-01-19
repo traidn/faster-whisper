@@ -4,3 +4,5 @@ huggingface_hub>=0.13
 tokenizers>=0.13,<0.16
 onnxruntime>=1.14,<2
 auditok==0.2.0
+scipy==1.11.4
+
