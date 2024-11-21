@@ -215,6 +215,7 @@ class WhisperModel:
         append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
         vad_filter: bool = False,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
+        vad_marks: Optional[list] = None,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """Transcribes an input file.
 
@@ -266,6 +267,7 @@ class WhisperModel:
             https://github.com/snakers4/silero-vad.
           vad_parameters: Dictionary of Silero VAD parameters or VadOptions class (see available
             parameters and default values in the class `VadOptions`).
+          vad_marks: List of dictionary of ready VAD marks ({start: int, end: int}) in samples which can be used instead of own VAD.
 
         Returns:
           A tuple with:
@@ -285,6 +287,12 @@ class WhisperModel:
         self.logger.info(
             "Processing audio with duration %s", format_timestamp(duration)
         )
+
+        speech_chunks = None
+
+        if vad_marks is not None:
+            vad_filter = False
+            speech_chunks = vad_marks
 
         if vad_filter:
             if vad_parameters is None:
@@ -312,9 +320,6 @@ class WhisperModel:
                         for chunk in speech_chunks
                     ),
                 )
-
-        else:
-            speech_chunks = None
 
         features = self.feature_extractor(audio)
 
@@ -570,7 +575,6 @@ class WhisperModel:
                     options.append_punctuations,
                     last_speech_timestamp=last_speech_timestamp,
                 )
-
                 word_end_timestamps = [
                     w["end"] for s in current_segments for w in s["words"]
                 ]
